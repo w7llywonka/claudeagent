@@ -1,0 +1,12 @@
+*
+!Dockerfile
+!requirements.txt
+!entrypoint.sh
+!bot/
+!bot/**
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.db
+**/*.db-*

@@ -1,0 +1,27 @@
+name: Test bot and Railway image
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build Railway container
+        run: docker build -t discord-haiku-bot:test .
+      - name: Run offline tests in the Linux image
+        run: >-
+          docker run --rm --entrypoint python
+          --mount type=bind,source=${{ github.workspace }}/tests,target=/app/tests,readonly
+          discord-haiku-bot:test -m unittest discover -s tests -v
+      - name: Verify volume permissions and non-root runtime
+        run: |
+          docker run --rm --tmpfs /data discord-haiku-bot:test python -c 'import os; from bot.store import Store; assert os.getuid() == 10001; s = Store("/data/chat.db"); s.close(); print("Persistent directory writable by app user")'

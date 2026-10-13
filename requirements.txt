@@ -1,0 +1,3 @@
+# Latest stable releases verified on PyPI on 2026-10-12.
+discord.py==2.7.1
+httpx==0.28.1
