@@ -246,6 +246,45 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.recent("one", now=self.now), [
             {"user": "alice", "text": "human message", "is_bot": False, "sources": []}])
 
+    def test_bot_message_identity_and_channel_are_isolated_after_restart(self):
+        self.store.record_bot_message("one", "message1", "bot1", now=self.now)
+        self.reopen()
+        self.assertTrue(self.store.is_bot_message("one", "message1", "bot1"))
+        self.assertFalse(self.store.is_bot_message("two", "message1", "bot1"))
+        self.assertFalse(self.store.is_bot_message("one", "message1", "bot2"))
+        self.assertFalse(self.store.is_bot_message("one", "missing", "bot1"))
+
+    def test_bot_message_metadata_has_one_global_bound(self):
+        with patch("bot.store.MAX_BOT_MESSAGE_ROWS", 3):
+            for index in range(5):
+                self.store.record_bot_message(f"channel{index}", f"message{index}",
+                                              f"bot{index}", now=self.now + index)
+        self.assertEqual(self.rows("bot_messages"), 3)
+        self.assertFalse(self.store.is_bot_message("channel0", "message0", "bot0"))
+        self.assertFalse(self.store.is_bot_message("channel1", "message1", "bot1"))
+        for index in range(2, 5):
+            self.assertTrue(self.store.is_bot_message(f"channel{index}", f"message{index}", f"bot{index}"))
+
+    def test_forget_optout_and_retention_do_not_remove_bot_message_ids(self):
+        self.store.record_bot_message("one", "message1", "bot1", now=self.now)
+        self.store.observe("one", "alice", "human text", now=self.now)
+        self.store.forget("alice")
+        self.store.set_opt_out("alice", True)
+        self.store.observe("one", "bob", "later text", now=self.now + MEMORY_SECONDS * 2)
+        self.assertTrue(self.store.is_bot_message("one", "message1", "bot1"))
+        self.assertEqual(self.rows("bot_messages"), 1)
+
+    def test_recording_known_bot_message_refreshes_without_duplicate_rows(self):
+        with patch("bot.store.MAX_BOT_MESSAGE_ROWS", 2):
+            self.store.record_bot_message("one", "message1", "bot1", now=self.now)
+            self.store.record_bot_message("one", "message2", "bot1", now=self.now + 1)
+            self.store.record_bot_message("one", "message1", "bot1", now=self.now + 2)
+            self.store.record_bot_message("one", "message3", "bot1", now=self.now + 3)
+        self.assertEqual(self.rows("bot_messages"), 2)
+        self.assertTrue(self.store.is_bot_message("one", "message1", "bot1"))
+        self.assertTrue(self.store.is_bot_message("one", "message3", "bot1"))
+        self.assertFalse(self.store.is_bot_message("one", "message2", "bot1"))
+
 
 if __name__ == "__main__":
     unittest.main()

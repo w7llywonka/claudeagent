@@ -12,7 +12,7 @@ The bot cannot run commands, browse links, use tools, or change its settings thr
 
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications), create an application, and open **Bot**.
 2. Create/reset the bot token and keep it for Railway's `DISCORD_TOKEN` variable. Enable **Message Content Intent** under Privileged Gateway Intents. The bot needs this to read allowed-channel conversation and commands. Larger verified bots may require approval. [Discord intent documentation](https://docs.discord.com/developers/events/gateway#message-content-intent)
-3. Install the application into your server with the **bot** scope. Grant **View Channel** and **Send Messages** in the intended ordinary text channel. Administrator permissions are unnecessary. If using a thread, also grant **Send Messages in Threads** and allow that thread's own ID.
+3. Install the application into your server with the **bot** scope. Grant **View Channel**, **Send Messages**, and **Read Message History** in the intended ordinary text channel. Read Message History lets the bot verify an older reply target if Discord omits it from the event. Administrator permissions are unnecessary. If using a thread, also grant **Send Messages in Threads** and allow that thread's own ID.
 4. In Discord, enable **User Settings → Advanced → Developer Mode**. Right-click the intended channel and choose **Copy Channel ID**. Copy your own user ID the same way if you want the owner-only `!budget` command.
 5. Obtain an API key with credits and access to Haiku 5.5 from the [Claude Console](https://platform.claude.com/).
 
@@ -39,7 +39,7 @@ Setup uses Railway's dashboard deliberately: its older `railway.json`/`railway.t
 
 ### 3. Choose when it talks
 
-- **Default:** mention the bot or reply to a recent bot message still in its local cache. It never fetches old Discord history to reconstruct a reply.
+- **Default:** mention the bot **or use Discord's Reply action on one of its messages**. The reply's mention/ping toggle can be off. Reply detection checks the Discord event, local cache, and up to 4,096 persisted bot-message IDs, which survive restarts. If needed, it fetches only the exact message being replied to and checks its author; it never scans channel history. The fallback requires **Read Message History** and is limited to 20 lookups per minute, two concurrent lookups, and a five-second timeout. No Claude tokens are used for this check.
 - **Dedicated chat channel:** set `AUTO_REPLY_CHANNEL_IDS` to a subset of `ALLOWED_CHANNEL_IDS`. Every human message there is eligible for a reply, subject to the same limits.
 - **Direct messages:** set `ENABLE_DMS=true` to allow them. They are disabled by default.
 
@@ -61,7 +61,7 @@ These are local commands and do not call Claude.
 | `!optin` | Resume local learning and memory. |
 | `!budget` | Show the local spending ledger; only users listed in `OWNER_IDS` can use it. |
 
-Forgetting local data does not delete messages already posted to Discord or requests already received by Anthropic. Minimal opt-out, rate-limit and spending records remain as needed to enforce those controls. API keys are never placed in prompts. Keep them in Railway variables or your local process environment, never in chat or GitHub.
+Forgetting local data does not delete messages already posted to Discord or requests already received by Anthropic. Minimal opt-out, rate-limit and spending records remain as needed to enforce those controls. Content-free bot-message IDs also remain so replies still work; they contain only the bot/channel/message identifiers and timestamp. API keys are never placed in prompts. Keep them in Railway variables or your local process environment, never in chat or GitHub.
 
 ## How it stays inexpensive
 
@@ -146,7 +146,7 @@ The included GitHub Actions workflow builds the Railway Docker image, runs the o
 
 - Confirm the bot is online and `ALLOWED_CHANNEL_IDS` contains the current channel's exact ID.
 - Enable Message Content Intent in the Discord portal and redeploy.
-- Mention the bot unless the channel is configured for automatic replies. Old reply targets outside its small cache are not fetched.
+- Mention the bot or use Reply on one of its messages. For an older reply target outside its saved IDs/cache, enable **Read Message History** in that channel so it can verify the specific message. The reply mention/ping toggle can stay off.
 - Wait out `COOLDOWN_SECONDS` (15 seconds by default); shared rate/concurrency limits can also prevent a request.
 - Check Railway logs for authentication/model-access errors and inspect `!budget` as an owner. A depleted allowance deliberately stops paid replies.
 - If startup reports volume permissions, keep the default Docker entrypoint and `/data` mount. Do not override it with a direct Python start command.

@@ -26,6 +26,7 @@ MEMORY_SECONDS = 30 * 24 * 60 * 60
 MAX_CONTEXT_ROWS = 4096
 MAX_MEMORY_ROWS = 4096
 MAX_STYLE_ROWS = 4096
+MAX_BOT_MESSAGE_ROWS = 4096
 MAX_CONTEXT_SOURCES = 64
 SQLITE_MAX_INTEGER = (1 << 63) - 1
 
@@ -73,6 +74,11 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS context_channel ON context(channel, ts DESC, id DESC);
             CREATE INDEX IF NOT EXISTS context_user ON context(user);
+            CREATE TABLE IF NOT EXISTS bot_messages (
+                message_id TEXT PRIMARY KEY, channel TEXT NOT NULL,
+                bot_id TEXT NOT NULL, ts REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS bot_messages_recent ON bot_messages(ts DESC, message_id DESC);
             CREATE TABLE IF NOT EXISTS styles (
                 channel TEXT NOT NULL, user TEXT NOT NULL,
                 lowercase REAL NOT NULL, short_messages REAL NOT NULL,
@@ -148,6 +154,25 @@ class Store:
     def opted_out(self, user: str) -> bool:
         with self._lock:
             return self._opted_out(str(user))
+
+    def record_bot_message(self, channel: str, message_id: str, bot_id: str,
+                           now: float | None = None) -> None:
+        """Remember reply targets without storing message content or human IDs."""
+        now = _timestamp(now)
+        with self._transaction():
+            self._db.execute("""INSERT INTO bot_messages(message_id,channel,bot_id,ts)
+                VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
+                channel=excluded.channel,bot_id=excluded.bot_id,ts=excluded.ts""",
+                             (str(message_id), str(channel), str(bot_id), now))
+            self._db.execute("""DELETE FROM bot_messages WHERE message_id IN
+                (SELECT message_id FROM bot_messages ORDER BY ts DESC,message_id DESC
+                 LIMIT -1 OFFSET ?)""", (MAX_BOT_MESSAGE_ROWS,))
+
+    def is_bot_message(self, channel: str, message_id: str, bot_id: str) -> bool:
+        with self._lock:
+            return self._db.execute("""SELECT 1 FROM bot_messages
+                WHERE message_id=? AND channel=? AND bot_id=?""",
+                                    (str(message_id), str(channel), str(bot_id))).fetchone() is not None
 
     def observe(self, channel: str, user: str, text: str, is_bot: bool = False,
                 now: float | None = None, sources: Iterable[str] | None = None) -> None:
