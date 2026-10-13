@@ -33,6 +33,9 @@ class DiscordChat(discord.Client):
 
     async def on_ready(self):
         log.info("Connected to Discord; model=claude-haiku-5-5 effort=low; allowed_channels=%d", len(self.engine.config.allowed_channels))
+        config = self.engine.config
+        log.info("Message archive: passive=%s retention_days=%d max_rows=%d max_text_mib=%d",
+                 config.passive_learning, config.message_retention_days, config.message_max_rows, config.message_max_mb)
 
     async def _is_reply_to_bot(self, message):
         reference = message.reference
@@ -102,7 +105,8 @@ class DiscordChat(discord.Client):
                 return
             replied = False if mentioned else await self._is_reply_to_bot(message)
             event = Incoming(str(message.author.id), str(message.channel.id), text,
-                             mentioned or replied, message.guild is None, message.author.bot)
+                             mentioned or replied, message.guild is None, message.author.bot,
+                             message_id=str(message.id))
             answer = await self.engine.process(event)
             if answer:
                 # Plain content only. No embeds, files, tools, eval or command dispatch.
@@ -123,7 +127,8 @@ class DiscordChat(discord.Client):
 
 
 async def run(config):
-    store = Store(config.db_path)
+    store = Store(config.db_path, message_retention_days=config.message_retention_days,
+                  message_max_rows=config.message_max_rows, message_max_bytes=config.message_max_mb * 1024 * 1024)
     provider = ClaudeClient(config.api_key)
     client = DiscordChat(ChatEngine(config, store, provider))
     loop = asyncio.get_running_loop()

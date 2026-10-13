@@ -26,6 +26,22 @@ def request_payload(settings=None):
 
 
 class RequestTests(unittest.TestCase):
+    def test_message_archive_limits_have_bounded_defaults_and_validated_overrides(self):
+        default = config()
+        self.assertEqual((default.message_retention_days, default.message_max_rows, default.message_max_mb),
+                         (30, 50000, 64))
+        for name, attribute, minimum, maximum in (
+            ("MESSAGE_RETENTION_DAYS", "message_retention_days", 1, 365),
+            ("MESSAGE_MAX_ROWS", "message_max_rows", 100, 1_000_000),
+            ("MESSAGE_MAX_MB", "message_max_mb", 1, 128),
+        ):
+            for valid in (minimum, maximum):
+                with self.subTest(name=name, value=valid):
+                    self.assertEqual(getattr(config(**{name: str(valid)}), attribute), valid)
+            for invalid in (minimum - 1, maximum + 1, "1.5"):
+                with self.subTest(name=name, value=invalid), self.assertRaises(ValueError):
+                    config(**{name: str(invalid)})
+
     def test_cooldown_configuration_defaults_to_fifteen_and_accepts_zero_or_custom(self):
         self.assertEqual(config().cooldown_seconds, 15)
         for value in (0, 30, 86400):

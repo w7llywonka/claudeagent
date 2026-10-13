@@ -62,6 +62,7 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
             spec=discord.abc.Messageable.fetch_message.__get__(channel), return_value=self.target_message(),
         )
         fields = {
+            "id": 888888888888888888,
             "content": content,
             "author": SimpleNamespace(id=USER_ID, bot=False),
             "channel": channel,
@@ -85,6 +86,7 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.triggered)
         self.assertEqual(event.text, "hey  how is <@777777777777777777>")
         self.assertEqual((event.user, event.channel), (str(USER_ID), str(CHANNEL_ID)))
+        self.assertEqual(event.message_id, "888888888888888888")
         self.assertFalse(event.is_dm)
         self.assertFalse(event.is_bot)
         message.channel.fetch_message.assert_not_awaited()

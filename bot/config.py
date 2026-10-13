@@ -70,6 +70,9 @@ class Config:
     max_concurrent: int = 2
     max_per_minute: int = 20
     cooldown_seconds: int = 15
+    message_retention_days: int = 30
+    message_max_rows: int = 50_000
+    message_max_mb: int = 64
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None):
@@ -103,4 +106,7 @@ class Config:
             max_concurrent=_integer(env, "MAX_CONCURRENT_REQUESTS", 2, 1, 4),
             max_per_minute=_integer(env, "MAX_REQUESTS_PER_MINUTE", 20, 1, 120),
             cooldown_seconds=_integer(env, "COOLDOWN_SECONDS", 15, 0, 86400),
+            message_retention_days=_integer(env, "MESSAGE_RETENTION_DAYS", 30, 1, 365),
+            message_max_rows=_integer(env, "MESSAGE_MAX_ROWS", 50_000, 100, 1_000_000),
+            message_max_mb=_integer(env, "MESSAGE_MAX_MB", 64, 1, 128),
         )

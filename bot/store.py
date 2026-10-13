@@ -55,7 +55,15 @@ def _text(value: str, maximum: int) -> str:
 
 
 class Store:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, message_retention_days: int = 30,
+                 message_max_rows: int = 50_000, message_max_bytes: int = 64 * 1024 * 1024):
+        for name, value in (("message_retention_days", message_retention_days),
+                            ("message_max_rows", message_max_rows), ("message_max_bytes", message_max_bytes)):
+            if type(value) is not int or not 1 <= value <= SQLITE_MAX_INTEGER:
+                raise ValueError(f"{name} must be a positive integer")
+        self._message_retention_seconds = message_retention_days * 86400
+        self._message_max_rows = message_max_rows
+        self._message_max_bytes = message_max_bytes
         if path != ":memory:":
             Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -66,7 +74,26 @@ class Store:
         self._db.execute("PRAGMA busy_timeout=10000")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
+        self._db.execute("PRAGMA journal_size_limit=8388608")
         self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY, message_id TEXT UNIQUE,
+                channel TEXT NOT NULL, user TEXT NOT NULL, text TEXT NOT NULL,
+                text_bytes INTEGER NOT NULL CHECK(text_bytes >= 0), ts REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS messages_age ON messages(ts,id);
+            CREATE INDEX IF NOT EXISTS messages_user ON messages(user);
+            CREATE TABLE IF NOT EXISTS message_stats (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                row_count INTEGER NOT NULL CHECK(row_count >= 0),
+                text_bytes INTEGER NOT NULL CHECK(text_bytes >= 0)
+            );
+            CREATE TRIGGER IF NOT EXISTS messages_insert_stats AFTER INSERT ON messages BEGIN
+                UPDATE message_stats SET row_count=row_count+1,text_bytes=text_bytes+NEW.text_bytes WHERE id=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_delete_stats AFTER DELETE ON messages BEGIN
+                UPDATE message_stats SET row_count=row_count-1,text_bytes=text_bytes-OLD.text_bytes WHERE id=1;
+            END;
             CREATE TABLE IF NOT EXISTS context (
                 id INTEGER PRIMARY KEY, channel TEXT NOT NULL, user TEXT NOT NULL,
                 text TEXT NOT NULL, is_bot INTEGER NOT NULL, ts REAL NOT NULL,
@@ -112,6 +139,12 @@ class Store:
         # A crash can occur after the provider charged but before usage arrived.
         # Never refund such a call, including when the clock rolls into a new day.
         with self._transaction():
+            if self._db.execute("SELECT 1 FROM message_stats WHERE id=1").fetchone() is None:
+                # This scan is migration-only. Per-message accounting is constant
+                # time; triggers also keep counts correct during forget/pruning.
+                self._db.execute("""INSERT INTO message_stats(id,row_count,text_bytes)
+                    SELECT 1,COUNT(*),COALESCE(SUM(text_bytes),0) FROM messages""")
+            self._prune_messages(_timestamp())
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(context)")}
             if "sources" not in columns:
                 self._db.execute("ALTER TABLE context ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'")
@@ -146,7 +179,51 @@ class Store:
         self._db.execute("DELETE FROM samples WHERE ts < ?", (now - 60,))
         self._db.execute("DELETE FROM cooldowns WHERE expires <= ?", (now,))
         self._db.execute("DELETE FROM admissions WHERE ts <= ?", (now - 60,))
+        self._prune_messages(now)
         self._next_cleanup = now + 3600
+
+    def _prune_messages(self, now: float) -> None:
+        """Caller owns a transaction; only indexed expired/oldest rows are read."""
+        self._db.execute("DELETE FROM messages WHERE ts < ?", (now - self._message_retention_seconds,))
+        stats = self._db.execute("SELECT row_count,text_bytes FROM message_stats WHERE id=1").fetchone()
+        rows, size = stats["row_count"], stats["text_bytes"]
+        while rows > self._message_max_rows or size > self._message_max_bytes:
+            batch_size = 256 if size > self._message_max_bytes else min(256, rows - self._message_max_rows)
+            oldest = self._db.execute("SELECT id,text_bytes FROM messages ORDER BY ts,id LIMIT ?", (batch_size,)).fetchall()
+            remove = []
+            for row in oldest:
+                if rows <= self._message_max_rows and size <= self._message_max_bytes:
+                    break
+                remove.append(row["id"])
+                rows -= 1
+                size -= row["text_bytes"]
+            if not remove:
+                raise RuntimeError("archive counters are inconsistent")
+            placeholders = ",".join("?" for _ in remove)
+            self._db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", remove)
+
+    def archive_message(self, channel: str, user: str, text: str, message_id: str | None = None,
+                        now: float | None = None) -> bool:
+        """Archive caller-sanitized human text; this archive is never model context.
+
+        A duplicate Discord ID is ignored. Messages without IDs remain distinct.
+        Limits may immediately evict an inserted message if it alone exceeds the
+        configured byte cap, or its supplied timestamp is already expired.
+        """
+        now, channel, user = _timestamp(now), str(channel), str(user)
+        text = text[:4000].strip()
+        if not text:
+            return False
+        with self._transaction():
+            if self._opted_out(user):
+                return False
+            result = self._db.execute("""INSERT INTO messages(message_id,channel,user,text,text_bytes,ts)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING""",
+                                      (str(message_id) if message_id is not None else None,
+                                       channel, user, text, len(text.encode("utf-8")), now))
+            inserted = result.rowcount == 1
+            self._prune_messages(now)
+            return inserted
 
     def _opted_out(self, user: str) -> bool:
         return self._db.execute("SELECT 1 FROM opt_out WHERE user=?", (user,)).fetchone() is not None
@@ -177,7 +254,8 @@ class Store:
     def observe(self, channel: str, user: str, text: str, is_bot: bool = False,
                 now: float | None = None, sources: Iterable[str] | None = None) -> None:
         now, channel, user = _timestamp(now), str(channel), str(user)
-        text = _text(text, 240)
+        style_text = _text(text, 4000)
+        text = style_text[:240]
         if not text:
             return
         dependencies = set()
@@ -191,12 +269,6 @@ class Store:
             self._cleanup(now)
             if self._opted_out(user):
                 return
-            if not is_bot:
-                last_sample = self._db.execute("SELECT ts FROM samples WHERE user=?", (user,)).fetchone()
-                if last_sample is not None and now - last_sample[0] < 15:
-                    return
-                self._db.execute("INSERT INTO samples(user,ts) VALUES(?,?) ON CONFLICT(user) DO UPDATE SET ts=excluded.ts",
-                                 (user, now))
             self._db.execute("INSERT INTO context(channel,user,text,is_bot,ts,sources) VALUES(?,?,?,?,?,?)",
                              (channel, user, text, int(is_bot), now, serialized_sources))
             self._db.execute("""DELETE FROM context WHERE channel=? AND id NOT IN
@@ -207,11 +279,11 @@ class Store:
                              (MAX_CONTEXT_ROWS,))
             if is_bot:
                 return
-            letters = [char for char in text if char.islower() or char.isupper()]
+            letters = [char for char in style_text if char.islower() or char.isupper()]
             values = (
                 sum(char.islower() for char in letters) / max(1, len(letters)),
-                float(len(text) <= 80), float("?" in text), float("!" in text),
-                float(any(ord(char) > 127 and unicodedata.category(char) in {"So", "Sk"} for char in text)),
+                float(len(style_text) <= 80), float("?" in style_text), float("!" in style_text),
+                float(any(ord(char) > 127 and unicodedata.category(char) in {"So", "Sk"} for char in style_text)),
             )
             self._db.execute("""INSERT INTO styles
                 (channel,user,lowercase,short_messages,questions,exclamations,emoji,samples,ts)
@@ -225,9 +297,6 @@ class Store:
                              (channel, user, *values, now))
             self._db.execute("""DELETE FROM styles WHERE rowid IN
                 (SELECT rowid FROM styles ORDER BY ts DESC,rowid DESC LIMIT -1 OFFSET ?)""",
-                             (MAX_STYLE_ROWS,))
-            self._db.execute("""DELETE FROM samples WHERE rowid IN
-                (SELECT rowid FROM samples ORDER BY ts DESC,rowid DESC LIMIT -1 OFFSET ?)""",
                              (MAX_STYLE_ROWS,))
 
     def recent(self, channel: str, limit: int = 6, now: float | None = None) -> list[dict]:
@@ -251,12 +320,24 @@ class Store:
                             "is_bot": bool(row["is_bot"]), "sources": dependencies})
         return entries
 
-    def style(self, channel: str, user: str) -> dict:
+    def style(self, channel: str, user: str, now: float | None = None) -> dict:
         with self._lock:
             row = self._db.execute("""SELECT lowercase,short_messages,questions,exclamations,emoji,samples
                 FROM styles WHERE channel=? AND user=? AND ts>=?""",
-                                   (str(channel), str(user), _timestamp() - MEMORY_SECONDS)).fetchone()
-            return dict(row) if row else {}
+                                   (str(channel), str(user), _timestamp(now) - MEMORY_SECONDS)).fetchone()
+            return {key: round(value, 3) if isinstance(value, float) else value
+                    for key, value in dict(row).items()} if row else {}
+
+    def channel_style(self, channel: str, now: float | None = None) -> dict:
+        """Equal weight per active person, so prolific users do not own a room's style."""
+        with self._lock:
+            row = self._db.execute("""SELECT AVG(lowercase) AS lowercase,
+                AVG(short_messages) AS short_messages,AVG(questions) AS questions,
+                AVG(exclamations) AS exclamations,AVG(emoji) AS emoji,COUNT(*) AS profiles
+                FROM styles WHERE channel=? AND ts>=?""",
+                                   (str(channel), _timestamp(now) - MEMORY_SECONDS)).fetchone()
+            return {key: round(value, 3) if isinstance(value, float) else value
+                    for key, value in dict(row).items()} if row["profiles"] else {}
 
     def remember(self, channel: str, user: str, text: str, now: float | None = None) -> None:
         """Called only for a user's explicit opt-in remember command."""
@@ -288,6 +369,7 @@ class Store:
         return [row["text"] for row in ranked[:max(0, min(int(limit), 8))]]
 
     def _forget(self, user: str) -> None:
+        self._db.execute("DELETE FROM messages WHERE user=?", (user,))
         self._db.execute("DELETE FROM context WHERE user=? OR is_bot=1", (user,))
         self._db.execute("DELETE FROM styles WHERE user=?", (user,))
         self._db.execute("DELETE FROM samples WHERE user=?", (user,))

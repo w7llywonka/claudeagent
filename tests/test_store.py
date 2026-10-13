@@ -33,6 +33,17 @@ class StoreTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as connection:
             return connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
+    def assert_archive_counters(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            actual = connection.execute("SELECT COUNT(*),COALESCE(SUM(text_bytes),0) FROM messages").fetchone()
+            cached = connection.execute("SELECT row_count,text_bytes FROM message_stats WHERE id=1").fetchone()
+        self.assertEqual(cached, actual)
+        return actual
+
+    def archive_texts(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            return [row[0] for row in connection.execute("SELECT text FROM messages ORDER BY ts,id")]
+
     def test_context_is_bounded_truncated_and_channel_isolated(self):
         for index in range(12):
             self.store.observe("one", str(index), "x" * 300, now=self.now + index)
@@ -43,7 +54,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.recent("two", now=self.now)[0]["text"], "private")
         self.assertEqual(self.store.recent("one", now=self.now + 1900), [])
 
-    def test_human_context_and_style_sampling_is_global_per_user(self):
+    def test_every_rapid_human_message_updates_context_and_style(self):
         self.store.observe("one", "alice", "hey there", now=self.now)
         self.store.observe("one", "alice", "SPAM!", now=self.now + 1)
         self.store.observe("two", "alice", "SPAM!", now=self.now + 2)
@@ -51,13 +62,13 @@ class StoreTests(unittest.TestCase):
         self.store.observe("one", "bot", "reply", is_bot=True, now=self.now + 15)
         self.store.observe("one", "bot", "another reply", is_bot=True, now=self.now + 16)
         style = self.store.style("one", "alice")
-        self.assertEqual(style["samples"], 2)
-        self.assertAlmostEqual(style["lowercase"], 0.8)
+        self.assertEqual(style["samples"], 3)
+        self.assertAlmostEqual(style["lowercase"], 0.64)
         self.assertAlmostEqual(style["questions"], 0.2)
         self.assertTrue(all(isinstance(value, (int, float, bool)) for value in style.values()))
         self.assertEqual(self.store.style("one", "bot"), {})
-        self.assertEqual(self.store.recent("two", now=self.now + 16), [])
-        self.assertEqual(len(self.store.recent("one", now=self.now + 16)), 4)
+        self.assertEqual(len(self.store.recent("two", now=self.now + 16)), 1)
+        self.assertEqual(len(self.store.recent("one", now=self.now + 16)), 5)
 
     def test_fact_retention_retrieval_and_user_channel_isolation(self):
         self.store.remember("one", "alice", "I like chess", now=self.now)
@@ -89,7 +100,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.rows("context"), 12)
         self.assertEqual(self.rows("facts"), 12)
         self.assertEqual(self.rows("styles"), 12)
-        self.assertEqual(self.rows("samples"), 12)
+        self.assertEqual(self.rows("samples"), 0)
 
     def test_forget_clears_all_user_channels_and_all_bot_replies(self):
         for channel in ("one", "two"):
@@ -284,6 +295,131 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(self.store.is_bot_message("one", "message1", "bot1"))
         self.assertTrue(self.store.is_bot_message("one", "message3", "bot1"))
         self.assertFalse(self.store.is_bot_message("one", "message2", "bot1"))
+
+    def test_archive_keeps_rapid_messages_full_length_and_no_model_context(self):
+        self.assertTrue(self.store.archive_message("one", "alice", "x" * 5000, "first", now=self.now))
+        self.assertTrue(self.store.archive_message("one", "alice", "second", "second", now=self.now + 0.1))
+        self.assertEqual(self.archive_texts(), ["x" * 4000, "second"])
+        self.assertEqual(self.store.recent("one", now=self.now), [])
+        self.assertEqual(self.store.style("one", "alice", now=self.now), {})
+        self.assertEqual(self.assert_archive_counters(), (2, 4006))
+
+    def test_archive_duplicate_ids_are_ignored_but_missing_ids_remain_distinct(self):
+        self.assertTrue(self.store.archive_message("one", "alice", "original", "unique", now=self.now))
+        self.assertFalse(self.store.archive_message("two", "bob", "different", "unique", now=self.now + 1))
+        self.assertTrue(self.store.archive_message("one", "alice", "no id", now=self.now))
+        self.assertTrue(self.store.archive_message("one", "alice", "no id", now=self.now))
+        self.reopen()
+        self.assertFalse(self.store.archive_message("one", "alice", "original", "unique", now=self.now + 2))
+        self.assertEqual(self.archive_texts(), ["original", "no id", "no id"])
+        self.assertEqual(self.assert_archive_counters(), (3, 18))
+
+    def test_archive_row_cap_prunes_exact_oldest_across_channels(self):
+        self.store.close()
+        self.store = Store(self.path, message_max_rows=3)
+        for index in range(6):
+            self.assertTrue(self.store.archive_message(str(index), str(index), f"msg{index}", now=self.now + index))
+        self.assertEqual(self.archive_texts(), ["msg3", "msg4", "msg5"])
+        self.assertEqual(self.assert_archive_counters(), (3, 12))
+
+    def test_archive_byte_cap_counts_utf8_and_prunes_exact_oldest(self):
+        self.store.close()
+        self.store = Store(self.path, message_max_bytes=10)
+        self.store.archive_message("one", "alice", "aa", now=self.now)
+        self.store.archive_message("two", "bob", "éé", now=self.now + 1)
+        self.store.archive_message("two", "bob", "猫猫", now=self.now + 2)
+        self.assertEqual(self.archive_texts(), ["éé", "猫猫"])
+        self.assertEqual(self.assert_archive_counters(), (2, 10))
+        self.store.archive_message("one", "alice", "Z", now=self.now + 3)
+        self.assertEqual(self.archive_texts(), ["猫猫", "Z"])
+        self.assertEqual(self.assert_archive_counters(), (2, 7))
+
+    def test_archive_retention_applies_on_insert_and_restart(self):
+        self.store.close()
+        self.store = Store(self.path, message_retention_days=1)
+        self.store.archive_message("one", "alice", "expired", now=self.now - 86401)
+        self.store.archive_message("one", "alice", "boundary", now=self.now - 86400)
+        self.store.archive_message("one", "alice", "current", now=self.now)
+        self.assertEqual(self.archive_texts(), ["boundary", "current"])
+        self.store.close()
+        with patch("bot.store.time.time", return_value=self.now + 1):
+            self.store = Store(self.path, message_retention_days=1)
+        self.assertEqual(self.archive_texts(), ["current"])
+        self.assertEqual(self.assert_archive_counters(), (1, 7))
+
+    def test_archive_reduced_limits_apply_immediately_on_restart(self):
+        for index in range(6):
+            self.store.archive_message("one", "alice", f"msg{index}", now=self.now + index)
+        self.store.close()
+        self.store = Store(self.path, message_max_rows=4, message_max_bytes=9)
+        self.assertEqual(self.archive_texts(), ["msg4", "msg5"])
+        self.assertEqual(self.assert_archive_counters(), (2, 8))
+
+    def test_forget_and_optout_erase_archive_and_keep_counters_correct(self):
+        self.store.archive_message("one", "alice", "secret", now=self.now)
+        self.store.archive_message("two", "alice", "other secret", now=self.now)
+        self.store.archive_message("one", "bob", "keep", now=self.now)
+        self.store.forget("alice")
+        self.assertEqual(self.archive_texts(), ["keep"])
+        self.assertEqual(self.assert_archive_counters(), (1, 4))
+        self.store.set_opt_out("bob", True)
+        self.assertEqual(self.assert_archive_counters(), (0, 0))
+        self.assertFalse(self.store.archive_message("one", "bob", "blocked", now=self.now))
+        self.assertFalse(self.store.archive_message("one", "alice", " \n\t ", now=self.now))
+        self.reopen()
+        self.assertFalse(self.store.archive_message("two", "bob", "still blocked", now=self.now))
+        self.store.set_opt_out("bob", False)
+        self.assertTrue(self.store.archive_message("two", "bob", "allowed", now=self.now))
+        self.assertEqual(self.assert_archive_counters(), (1, 7))
+
+    def test_archive_migrates_existing_database_without_changing_other_memory(self):
+        self.store.observe("one", "alice", "existing recent", now=self.now)
+        self.store.close()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("DROP TABLE messages")
+            connection.execute("DROP TABLE message_stats")
+            connection.commit()
+        self.store = Store(self.path)
+        self.assertEqual(self.store.recent("one", now=self.now)[0]["text"], "existing recent")
+        self.assertTrue(self.store.archive_message("one", "alice", "new archive", now=self.now))
+        self.assertEqual(self.assert_archive_counters(), (1, 11))
+
+    def test_archive_rejects_invalid_limit_configuration(self):
+        for option in ("message_retention_days", "message_max_rows", "message_max_bytes"):
+            for invalid in (0, -1, True, 0.5):
+                with self.subTest(option=option, invalid=invalid), self.assertRaises(ValueError):
+                    Store(":memory:", **{option: invalid})
+
+    def test_channel_style_weights_people_equally_not_message_volume(self):
+        for index in range(10):
+            self.store.observe("one", "alice", "quiet lowercase", now=self.now + index / 10)
+        self.store.observe("one", "bob", "LOUD!", now=self.now + 1)
+        self.store.observe("two", "carol", "separate room?", now=self.now + 1)
+        style = self.store.channel_style("one", now=self.now + 1)
+        self.assertEqual(style["profiles"], 2)
+        self.assertAlmostEqual(style["lowercase"], 0.5)
+        self.assertAlmostEqual(style["exclamations"], 0.5)
+        self.assertAlmostEqual(style["questions"], 0)
+        self.assertTrue(all(type(value) in (int, float) for value in style.values()))
+        self.assertEqual(self.store.channel_style("two", now=self.now + 1)["profiles"], 1)
+        self.assertEqual(self.store.channel_style("missing", now=self.now), {})
+
+    def test_channel_style_forget_optout_and_expiry_remove_influence(self):
+        self.store.observe("one", "alice", "lowercase", now=self.now)
+        self.store.observe("one", "bob", "UPPERCASE", now=self.now)
+        self.store.forget("alice")
+        self.assertEqual(self.store.channel_style("one", now=self.now)["lowercase"], 0)
+        self.assertEqual(self.store.channel_style("one", now=self.now)["profiles"], 1)
+        self.assertEqual(self.store.channel_style("one", now=self.now + MEMORY_SECONDS + 1), {})
+        self.store.set_opt_out("bob", True)
+        self.store.observe("one", "bob", "should not return", now=self.now)
+        self.assertEqual(self.store.channel_style("one", now=self.now), {})
+
+    def test_style_reads_full_bounded_message_beyond_recent_excerpt(self):
+        self.store.observe("one", "alice", "x" * 300 + "?", now=self.now)
+        self.assertEqual(len(self.store.recent("one", now=self.now)[0]["text"]), 240)
+        self.assertEqual(self.store.style("one", "alice", now=self.now)["questions"], 1)
+        self.assertEqual(self.store.style("one", "alice", now=self.now)["short_messages"], 0)
 
 
 if __name__ == "__main__":

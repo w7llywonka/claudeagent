@@ -20,6 +20,7 @@ class Incoming:
     triggered: bool
     is_dm: bool = False
     is_bot: bool = False
+    message_id: str | None = None
 
 
 class ChatEngine:
@@ -71,17 +72,28 @@ class ChatEngine:
         if command in {"!forget", "!optout"}:
             return self._privacy_command(event, command, now)
         is_command = command in COMMANDS
+        archived_text = self.clean(raw)
+        if not archived_text:
+            return None
+        text = archived_text[:self.config.max_input_chars]
+        opted_out = self.store.opted_out(event.user)
+        override = is_override(archived_text)
+        triggered = event.triggered or event.is_dm or event.channel in self.config.auto_reply_channels
+        recent = []
+        if not opted_out and (self.config.passive_learning or triggered):
+            # Capture every eligible message before reply cooldowns, outages or budget limits.
+            # This archive is never loaded into the model request.
+            if not self.store.archive_message(event.channel, event.user, archived_text,
+                                              message_id=event.message_id, now=now):
+                return None  # A repeated Discord delivery must not learn or reply twice.
+            if not raw.startswith("!") and not override:
+                if triggered:
+                    # Snapshot before observing so current_message isn't repeated in history.
+                    recent = self.store.recent(event.channel, self.config.context_messages, now=now)
+                self.store.observe(event.channel, event.user, archived_text, now=now)
         if raw.startswith("!") and not is_command:
             return None  # Don't spend money reacting to other bots' commands.
-        text = self.clean(raw[:self.config.max_input_chars])
-        if not text:
-            return None
-        opted_out = self.store.opted_out(event.user)
-        override = is_override(text)
-        triggered = event.triggered or event.is_dm or event.channel in self.config.auto_reply_channels
         if not triggered and not is_command:
-            if self.config.passive_learning and not opted_out and not override:
-                self.store.observe(event.channel, event.user, text, now=now)
             return None  # Most Discord messages cost zero API tokens.
         if self.store.admit(event.user, now, cooldown=self.config.cooldown_seconds,
                             per_minute=self.config.max_per_minute) != "ok":
@@ -102,7 +114,6 @@ class ChatEngine:
         ticket = {"valid": True, "users": {event.user}}
         self._pending[event.user] = ticket
         try:
-            recent = [] if opted_out else self.store.recent(event.channel, self.config.context_messages, now=now)
             aliases = {event.user: "you"}
             rendered = []
             for entry in recent:
@@ -113,14 +124,15 @@ class ChatEngine:
                     aliases[entry["user"]] = f"person{len(aliases)}"
                 rendered.append({"speaker": "bot" if entry["is_bot"] else aliases[entry["user"]], "text": entry["text"]})
             memories = [] if opted_out else self.store.memories(event.channel, event.user, text, limit=3)
-            style = {} if opted_out else self.store.style(event.channel, event.user)
+            style = {} if opted_out else {
+                "speaker": self.store.style(event.channel, event.user, now=now),
+                "channel": self.store.channel_style(event.channel, now=now),
+            }
             payload = build_request(self.config, current=text, recent=rendered, memories=memories, style=style)
             estimate = reserve_cost(payload)
             reservation = self.store.reserve(estimate, self.config.day_limit, self.config.month_limit, self.config.total_limit, now)
             if reservation is None:
                 return self._reply("taking a break for now, my chat budget is used up")
-            if not opted_out:
-                self.store.observe(event.channel, event.user, text, now=now)
             try:
                 # A total wall-clock timeout also bounds slow chunk-by-chunk responses.
                 async with asyncio.timeout(30):
@@ -156,7 +168,9 @@ class ChatEngine:
             return ("mention me or reply to me to chat. commands are !remember a fact, !forget, !optout, "
                     "!optin, !privacy and !budget. " + interval)
         if command == "!privacy":
-            return "i use recent channel chat and simple style habits. small amounts go to anthropic when i reply. use !forget to erase local memory or !optout to stop storage. !remember saves a short fact"
+            return (f"i save chat locally for up to {self.config.message_retention_days} days, less if storage fills. "
+                    "i learn simple style habits locally. only short context goes to anthropic when i reply. "
+                    "use !forget to erase your data or !optout to stop storage")
         if command == "!optin":
             self.store.set_opt_out(event.user, False)
             return "okay, i can learn your chat style again"
