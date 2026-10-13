@@ -103,7 +103,10 @@ class DiscordChat(discord.Client):
                                  mentioned, message.guild is None, message.author.bot)
             if not self.engine.allowed(candidate):
                 return
-            replied = False if mentioned else await self._is_reply_to_bot(message)
+            with self.engine.pending_incoming(candidate.user) as pending:
+                replied = False if mentioned else await self._is_reply_to_bot(message)
+                if not pending["valid"]:
+                    return  # The sender erased their data during the Discord lookup.
             event = Incoming(str(message.author.id), str(message.channel.id), text,
                              mentioned or replied, message.guild is None, message.author.bot,
                              message_id=str(message.id))

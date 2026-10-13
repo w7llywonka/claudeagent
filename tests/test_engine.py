@@ -71,6 +71,22 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             "SELECT message_id,user,channel,text FROM messages ORDER BY id"
         )]
 
+    async def test_pending_incoming_privacy_ticket_is_invalidated_and_cleaned_up(self):
+        with self.engine.pending_incoming(USER) as related:
+            with self.engine.pending_incoming("another-user") as unrelated:
+                self.assertTrue(related["valid"])
+                self.assertTrue(unrelated["valid"])
+                await self.engine.process(self.event("!forget", triggered=False))
+                self.assertFalse(related["valid"])
+                self.assertTrue(unrelated["valid"])
+        self.assertEqual(self.engine._pending, {})
+
+    async def test_pending_incoming_ticket_is_cleaned_up_on_cancellation(self):
+        with self.assertRaises(asyncio.CancelledError):
+            with self.engine.pending_incoming(USER):
+                raise asyncio.CancelledError()
+        self.assertEqual(self.engine._pending, {})
+
     async def test_cooldown_is_fifteen_seconds_across_channels(self):
         self.assertIsNotNone(await self.engine.process(self.event()))
         self.now += 14.99

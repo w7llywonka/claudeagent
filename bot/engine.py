@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from contextlib import contextmanager
 import asyncio
 import logging
 import time
@@ -37,6 +38,18 @@ class ChatEngine:
 
     def clean(self, text):
         return scrub(text, (self.config.discord_token, self.config.api_key))
+
+    @contextmanager
+    def pending_incoming(self, user):
+        # Reply lookup can await Discord before process() registers a model call.
+        # Keep that earlier wait erasable too; no per-user tombstones accumulate.
+        key = object()
+        ticket = {"valid": True, "users": {user}}
+        self._pending[key] = ticket
+        try:
+            yield ticket
+        finally:
+            self._pending.pop(key, None)
 
     def _reply(self, text):
         return words_only(text, max_words=self.config.max_reply_words,

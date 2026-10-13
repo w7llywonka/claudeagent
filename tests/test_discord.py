@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, Mock
 import discord
 
 from bot.__main__ import DiscordChat
+from bot.config import Config
+from bot.engine import ChatEngine
+from bot.store import Store
 
 
 BOT_ID = 111111111111111111
@@ -29,14 +32,31 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
             allowed=Mock(return_value=True),
             store=store,
             process=AsyncMock(side_effect=lambda event: "hey there" if event.triggered else None),
+            _pending={},
         )
+        self.engine.pending_incoming = ChatEngine.pending_incoming.__get__(self.engine)
         self.client = self.new_client()
 
-    def new_client(self):
-        client = DiscordChat(self.engine)
+    def new_client(self, engine=None):
+        client = DiscordChat(engine or self.engine)
         client._connection.user = SimpleNamespace(id=BOT_ID)
         self.addAsyncCleanup(client.close)
         return client
+
+    def real_engine(self):
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        config = Config(
+            discord_token="discord-test-token-never-valid",
+            api_key="sk-ant-fake-test-key-never-valid",
+            allowed_channels=frozenset({str(CHANNEL_ID)}),
+            auto_reply_channels=frozenset(), owner_ids=frozenset(),
+        )
+        provider = SimpleNamespace(
+            available=Mock(return_value=False),
+            complete=AsyncMock(side_effect=AssertionError("no provider call expected")),
+        )
+        return ChatEngine(config, store, provider)
 
     def reference(self, message_id=999, **changes):
         fields = {
@@ -173,6 +193,59 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
         await fresh_client.on_message(reply)
         self.assertTrue(self.engine.process.await_args.args[0].triggered)
         reply.channel.fetch_message.assert_not_awaited()
+
+    async def test_privacy_command_during_lookup_prevents_old_message_from_being_archived_again(self):
+        for command in ("!forget", "!optout"):
+            with self.subTest(command=command):
+                engine = self.real_engine()
+                client = self.new_client(engine)
+                started, release = asyncio.Event(), asyncio.Event()
+                old_message = self.message("old private text", reference=self.reference())
+
+                async def fetch(message_id):
+                    started.set()
+                    await release.wait()
+                    return self.target_message(message_id=message_id)
+
+                old_message.channel.fetch_message.side_effect = fetch
+                pending = asyncio.create_task(client.on_message(old_message))
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    await client.on_message(self.message(command, id=999888777666555444))
+                finally:
+                    release.set()
+                    await asyncio.wait_for(pending, 1)
+                self.assertEqual(engine.store._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+                self.assertEqual(engine.store.recent(str(CHANNEL_ID)), [])
+                engine.provider.complete.assert_not_awaited()
+                old_message.channel.send.assert_not_awaited()
+                self.assertEqual(engine._pending, {})
+                self.assertEqual(client._reference_inflight, 0)
+
+    async def test_another_users_forget_during_lookup_keeps_unrelated_incoming_message(self):
+        engine = self.real_engine()
+        client = self.new_client(engine)
+        started, release = asyncio.Event(), asyncio.Event()
+        old_message = self.message("keep this incoming text", reference=self.reference())
+
+        async def fetch(message_id):
+            started.set()
+            await release.wait()
+            return self.target_message(message_id=message_id)
+
+        old_message.channel.fetch_message.side_effect = fetch
+        pending = asyncio.create_task(client.on_message(old_message))
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            await client.on_message(self.message("!forget", author=SimpleNamespace(id=USER_ID + 1, bot=False)))
+        finally:
+            release.set()
+            await asyncio.wait_for(pending, 1)
+        rows = engine.store._db.execute("SELECT user,text FROM messages").fetchall()
+        self.assertEqual([(row["user"], row["text"]) for row in rows], [(str(USER_ID), "keep this incoming text")])
+        old_message.channel.send.assert_awaited_once()
+        engine.provider.complete.assert_not_awaited()
+        self.assertEqual(engine._pending, {})
 
     async def test_reference_lookup_concurrency_is_bounded_without_waiting_queue(self):
         gate = asyncio.Event()
