@@ -23,6 +23,7 @@ class Incoming:
     is_bot: bool = False
     message_id: str | None = None
     is_app_command: bool = False
+    is_bot_reply: bool = False
 
 
 class ChatEngine:
@@ -32,15 +33,16 @@ class ChatEngine:
         self._active_users = set()
         self._pending = {}
         self._privacy_notices = {}  # Only a short-lived local notice rate gate.
+        self._reply_limit_notices = {}
 
     def allowed(self, event: Incoming) -> bool:
-        return not event.is_bot and (event.is_app_command or (event.is_dm and self.config.enable_dms) or
+        return not event.is_bot and (event.is_app_command or event.is_bot_reply or (event.is_dm and self.config.enable_dms) or
                                     (not event.is_dm and event.channel in self.config.allowed_channels))
 
     def _memory_channel(self, event: Incoming) -> str:
-        # Explicit user-installed asks can run beyond the ambient-channel allowlist.
+        # Explicit asks and verified bot replies can run beyond the ambient allowlist.
         # Their memory belongs only to that person in that location.
-        if event.is_app_command and (event.is_dm or event.channel not in self.config.allowed_channels):
+        if (event.is_app_command or event.is_bot_reply) and (event.is_dm or event.channel not in self.config.allowed_channels):
             return f"ask:{event.channel}:{event.user}"
         return event.channel
 
@@ -100,11 +102,12 @@ class ChatEngine:
         text = archived_text[:self.config.max_input_chars]
         opted_out = self.store.opted_out(event.user)
         override = is_override(archived_text)
-        triggered = event.is_app_command or event.triggered or event.is_dm or event.channel in self.config.auto_reply_channels
+        triggered = (event.is_app_command or event.is_bot_reply or event.triggered or event.is_dm
+                     or event.channel in self.config.auto_reply_channels)
         recent = []
         if not opted_out and (self.config.passive_learning or triggered):
             # Capture every eligible message before reply cooldowns, outages or budget limits.
-            # This archive is never loaded into the model request.
+            # Only a few bounded, relevant excerpts can later enter a model request.
             if not self.store.archive_message(memory_channel, event.user, archived_text,
                                               message_id=event.message_id, now=now):
                 return None  # A repeated Discord delivery must not learn or reply twice.
@@ -120,7 +123,15 @@ class ChatEngine:
         admission = self.store.admit(event.user, now, cooldown=self.config.cooldown_seconds,
                                      per_minute=self.config.max_per_minute)
         if admission != "ok":
-            if event.is_app_command:
+            show_reply_notice = False
+            if event.is_bot_reply:
+                self._reply_limit_notices = {k: v for k, v in self._reply_limit_notices.items() if now - v < 15}
+                if event.user not in self._reply_limit_notices:
+                    if len(self._reply_limit_notices) >= 4096:
+                        self._reply_limit_notices.pop(next(iter(self._reply_limit_notices)))
+                    self._reply_limit_notices[event.user] = now
+                    show_reply_notice = True
+            if event.is_app_command or show_reply_notice:
                 return self._reply("give me a moment before asking again" if admission == "cooldown"
                                    else "chat's busy right now, try again in a minute")
             return None  # Silent cooldown: no bot spam and no model calls.
@@ -150,11 +161,24 @@ class ChatEngine:
                     aliases[entry["user"]] = f"person{len(aliases)}"
                 rendered.append({"speaker": "bot" if entry["is_bot"] else aliases[entry["user"]], "text": entry["text"]})
             memories = [] if opted_out else self.store.memories(memory_channel, event.user, text, limit=3)
+            earlier = [] if opted_out else self.store.recall(
+                memory_channel, event.user, text, limit=3, now=now, exclude_message_id=event.message_id,
+            )
+            # Don't pay to repeat facts already present in this small request.
+            known = {text.casefold(), archived_text[:240].casefold(),
+                     *(entry["text"].casefold() for entry in recent), *(fact.casefold() for fact in memories)}
+            recalled = []
+            for excerpt in earlier:
+                key = excerpt.casefold()
+                if key not in known:
+                    recalled.append(excerpt)
+                    known.add(key)
             style = {} if opted_out else {
                 "speaker": self.store.style(memory_channel, event.user, now=now),
                 "channel": self.store.channel_style(memory_channel, now=now),
             }
-            payload = build_request(self.config, current=text, recent=rendered, memories=memories, style=style)
+            payload = build_request(self.config, current=text, recent=rendered, memories=memories,
+                                    style=style, earlier=recalled)
             estimate = reserve_cost(payload)
             reservation = self.store.reserve(estimate, self.config.day_limit, self.config.month_limit, self.config.total_limit, now)
             if reservation is None:

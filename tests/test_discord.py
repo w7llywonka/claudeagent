@@ -98,7 +98,7 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
         message = self.message(
             f"<@{BOT_ID}> hey <@!{BOT_ID}> how is <@777777777777777777>",
             mentions=[SimpleNamespace(id=BOT_ID)],
-            reference=self.reference(),
+            reference=self.reference(resolved=self.target_message()),
         )
         await self.client.on_message(message)
         self.engine.process.assert_awaited_once()
@@ -109,6 +109,7 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.message_id, "888888888888888888")
         self.assertFalse(event.is_dm)
         self.assertFalse(event.is_bot)
+        self.assertTrue(event.is_bot_reply)
         message.channel.fetch_message.assert_not_awaited()
 
     async def test_reply_to_recent_bot_message_triggers_without_resolving_reference(self):
@@ -150,9 +151,9 @@ class DiscordAdapterTests(unittest.IsolatedAsyncioTestCase):
         message.channel.send.assert_not_awaited()
         self.assertNotIn((str(CHANNEL_ID), "999", str(BOT_ID)), self.saved_bot_messages)
 
-    async def test_disallowed_channel_skips_reference_lookup_and_engine(self):
+    async def test_unrelated_disallowed_message_skips_reference_lookup_and_engine(self):
         self.engine.allowed.return_value = False
-        message = self.message(reference=self.reference())
+        message = self.message()
         await self.client.on_message(message)
         message.channel.fetch_message.assert_not_awaited()
         self.engine.store.is_bot_message.assert_not_called()

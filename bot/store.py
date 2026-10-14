@@ -20,6 +20,8 @@ import time
 import unicodedata
 import uuid
 
+from .text import is_override
+
 
 CONTEXT_SECONDS = 30 * 60
 MEMORY_SECONDS = 30 * 24 * 60 * 60
@@ -29,6 +31,41 @@ MAX_STYLE_ROWS = 4096
 MAX_BOT_MESSAGE_ROWS = 4096
 MAX_CONTEXT_SOURCES = 64
 SQLITE_MAX_INTEGER = (1 << 63) - 1
+RECALL_CANDIDATES = 32
+RECALL_STOPWORDS = frozenset("""a an and are as at be been before but by can could did do does
+    for from had has have how i if in is it its just know last me more my no not now of on or
+    our please recall remember said say she so some tell that the their them then there these
+    they this those to told us was we were what when where which who why will with would you
+    your earlier again about also really ever something anything everything""".split())
+
+
+def _recall_terms(query: str) -> list[str]:
+    tokens = re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", query[:4000]).casefold())
+    terms = list(dict.fromkeys(token for token in tokens
+                               if 2 <= len(token) <= 64 and token not in RECALL_STOPWORDS))[:8]
+    if any(term in {"name", "call", "called"} for term in terms):
+        terms.extend(term for term in ("name", "call", "called") if term not in terms)
+    if any(term in {"favorite", "favourite", "fave"} for term in terms):
+        terms.extend(term for term in ("favorite", "favourite", "fave") if term not in terms)
+    return terms[:12]
+
+
+def _fts_quote(value: str) -> str:
+    # Used for both internally extracted words and exact local scope identifiers.
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _recall_excerpt(marked: str) -> str:
+    """Trim around the first FTS-highlighted match, including late Unicode hits."""
+    marked = " ".join(marked.split())
+    match_at = marked.find("\x01")
+    plain = marked.replace("\x01", "").replace("\x02", "")
+    if len(plain) <= 240:
+        return plain
+    start = max(0, min((match_at if match_at >= 0 else 0) - 80, len(plain) - 238))
+    end = min(len(plain), start + 238)
+    return (("…" if start else "") + plain[start:end].strip()
+            + ("…" if end < len(plain) else ""))
 
 
 def _timestamp(value: float | None = None) -> float:
@@ -83,6 +120,7 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS messages_age ON messages(ts,id);
             CREATE INDEX IF NOT EXISTS messages_user ON messages(user);
+            CREATE INDEX IF NOT EXISTS messages_recall ON messages(channel,user,ts DESC,id DESC);
             CREATE TABLE IF NOT EXISTS message_stats (
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 row_count INTEGER NOT NULL CHECK(row_count >= 0),
@@ -144,6 +182,7 @@ class Store:
                 # time; triggers also keep counts correct during forget/pruning.
                 self._db.execute("""INSERT INTO message_stats(id,row_count,text_bytes)
                     SELECT 1,COUNT(*),COALESCE(SUM(text_bytes),0) FROM messages""")
+            self._setup_message_search()
             self._prune_messages(_timestamp())
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(context)")}
             if "sources" not in columns:
@@ -168,6 +207,27 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self._db.close()
+
+    def _setup_message_search(self) -> None:
+        """Create/rebuild once for an existing archive; normal writes use triggers."""
+        existed = self._db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'").fetchone()
+        self._db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            text, channel, user, content='messages', content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2')""")
+        self._db.execute("""CREATE TRIGGER IF NOT EXISTS messages_insert_fts AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid,text,channel,user) VALUES(NEW.id,NEW.text,NEW.channel,NEW.user);
+        END""")
+        self._db.execute("""CREATE TRIGGER IF NOT EXISTS messages_delete_fts AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts,rowid,text,channel,user)
+                VALUES('delete',OLD.id,OLD.text,OLD.channel,OLD.user);
+        END""")
+        self._db.execute("""CREATE TRIGGER IF NOT EXISTS messages_update_fts AFTER UPDATE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts,rowid,text,channel,user)
+                VALUES('delete',OLD.id,OLD.text,OLD.channel,OLD.user);
+            INSERT INTO messages_fts(rowid,text,channel,user) VALUES(NEW.id,NEW.text,NEW.channel,NEW.user);
+        END""")
+        if not existed:
+            self._db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
 
     def _cleanup(self, now: float) -> None:
         """Caller owns a transaction. Expensive retention cleanup runs hourly."""
@@ -204,7 +264,7 @@ class Store:
 
     def archive_message(self, channel: str, user: str, text: str, message_id: str | None = None,
                         now: float | None = None) -> bool:
-        """Archive caller-sanitized human text; this archive is never model context.
+        """Archive caller-sanitized human text; only bounded recall snippets become context.
 
         A duplicate Discord ID is ignored. Messages without IDs remain distinct.
         Limits may immediately evict an inserted message if it alone exceeds the
@@ -224,6 +284,60 @@ class Store:
             inserted = result.rowcount == 1
             self._prune_messages(now)
             return inserted
+
+    def recall(self, channel: str, user: str, query: str, limit: int = 3,
+               now: float | None = None, exclude_message_id: str | None = None) -> list[str]:
+        """Return bounded, untrusted excerpts from this person's earlier messages.
+
+        Full-text search narrows candidates before reading message bodies. Generic
+        questions fall back to a small indexed recent slice, never an archive scan.
+        Current-timestamp rows are excluded even when no Discord ID was supplied.
+        """
+        now, channel, user = _timestamp(now), str(channel), str(user)
+        limit = max(0, min(int(limit), 3))
+        if not limit:
+            return []
+        terms = _recall_terms(query)
+        excluded = str(exclude_message_id) if exclude_message_id is not None else None
+        scope = (channel, user, now - self._message_retention_seconds, now, excluded, excluded)
+
+        def excerpts(rows):
+            result = []
+            seen = set()
+            for row in rows:
+                text = row["text"]
+                if text.lstrip().startswith("!") or is_override(text):
+                    continue
+                snippet = _recall_excerpt(row["excerpt"])
+                if snippet and snippet not in seen:
+                    result.append(snippet)
+                    seen.add(snippet)
+                if len(result) >= limit:
+                    break
+            return result
+
+        with self._lock:
+            if self._opted_out(user):
+                return []
+            if terms:
+                # Scope terms narrow the FTS posting lists; SQL repeats exact
+                # equality so tokenization can never mix similar channel/user IDs.
+                match = ("channel : " + _fts_quote(channel) + " AND user : " + _fts_quote(user)
+                         + " AND text : (" + " OR ".join(_fts_quote(term) for term in terms) + ")")
+                rows = self._db.execute("""SELECT m.text,
+                    snippet(messages_fts,0,char(1),char(2),'…',24) AS excerpt
+                    FROM messages_fts JOIN messages AS m ON m.id=messages_fts.rowid
+                    WHERE messages_fts MATCH ? AND m.channel=? AND m.user=? AND m.ts>=? AND m.ts<?
+                    AND (? IS NULL OR m.message_id IS NULL OR m.message_id<>?)
+                    ORDER BY messages_fts.rank LIMIT ?""", (match, *scope, RECALL_CANDIDATES)).fetchall()
+                found = excerpts(rows)
+                if found:
+                    return found
+            rows = self._db.execute("""SELECT text,text AS excerpt FROM messages
+                WHERE channel=? AND user=? AND ts>=? AND ts<?
+                AND (? IS NULL OR message_id IS NULL OR message_id<>?)
+                ORDER BY ts DESC,id DESC LIMIT ?""", (*scope, RECALL_CANDIDATES)).fetchall()
+            return excerpts(rows)
 
     def _opted_out(self, user: str) -> bool:
         return self._db.execute("SELECT 1 FROM opt_out WHERE user=?", (user,)).fetchone() is not None

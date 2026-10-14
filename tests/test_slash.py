@@ -3,7 +3,9 @@
 import asyncio
 from dataclasses import replace
 import json
+from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, Mock
@@ -95,6 +97,41 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
         return [dict(row) for row in self.store._db.execute(
             "SELECT user,channel,text FROM messages ORDER BY id"
         )]
+
+    def gateway_message(self, interaction, *, message_id, referenced_id=777777777777777777,
+                        mentioned=False, resolved=True, has_reference=True, target_author=BOT_ID, client=None):
+        client = client or self.client
+        guild = SimpleNamespace(id=interaction.guild_id) if interaction.guild_id is not None else None
+        channel = SimpleNamespace(
+            id=interaction.channel_id, guild=guild,
+            send=AsyncMock(return_value=SimpleNamespace(id=message_id + 1000)),
+            fetch_message=AsyncMock(side_effect=AssertionError("resolved or persisted reference should not fetch")),
+        )
+
+        def author(user_id):
+            return {"id": str(user_id), "username": "offline_user", "discriminator": "0000",
+                    "avatar": None, "bot": user_id == BOT_ID}
+
+        data = {
+            "id": str(message_id), "channel_id": str(channel.id), "type": 19 if has_reference else 0,
+            "content": (f"<@{BOT_ID}> " if mentioned else "") + "what about our orchids?",
+            "author": author(interaction.user.id), "mentions": [author(BOT_ID)] if mentioned else [],
+            "mention_roles": [], "attachments": [], "embeds": [],
+        }
+        if interaction.guild_id is not None:
+            data["guild_id"] = str(interaction.guild_id)
+        if has_reference:
+            data["message_reference"] = {"message_id": str(referenced_id), "channel_id": str(channel.id)}
+            if interaction.guild_id is not None:
+                data["message_reference"]["guild_id"] = str(interaction.guild_id)
+            if resolved:
+                data["referenced_message"] = {
+                    "id": str(referenced_id), "channel_id": str(channel.id), "type": 20,
+                    "content": "earlier slash response", "author": author(target_author),
+                    "mentions": [], "mention_roles": [], "attachments": [], "embeds": [],
+                    "webhook_id": str(BOT_ID),
+                }
+        return discord.Message(state=client._connection, channel=channel, data=data)
 
     def application(self, *, guild_scopes=("bot", "applications.commands"),
                     user_scopes=("applications.commands",), permissions=None, legacy=None):
@@ -218,6 +255,82 @@ class SlashCommandTests(unittest.IsolatedAsyncioTestCase):
         data = json.loads(self.provider.calls[0]["messages"][0]["content"])
         self.assertIn("shared room context", json.dumps(data["recent_conversation"]))
         self.assertEqual(self.archived()[0]["channel"], str(ALLOWED_CHANNEL_ID))
+
+    async def test_real_replies_to_slash_work_outside_allowlist_and_in_dms_with_either_mention_toggle(self):
+        for index, (is_dm, mentioned) in enumerate(((False, False), (False, True), (True, False), (True, True))):
+            with self.subTest(is_dm=is_dm, mentioned=mentioned):
+                self.now += 16
+                interaction = self.interaction(
+                    channel_id=CHANNEL_ID + int(is_dm), guild_id=None if is_dm else GUILD_ID,
+                    interaction_id=666666666666666700 + index,
+                )
+                response_id = 777777777777777700 + index
+                interaction.edit_original_response.return_value = SimpleNamespace(id=response_id)
+                await self.client.tree.ask(interaction, "our original orchids conversation")
+                before = len(self.provider.calls)
+                self.now += 16
+                message = self.gateway_message(interaction, message_id=888888888888888700 + index,
+                                               referenced_id=response_id, mentioned=mentioned)
+                self.assertEqual(message.type, discord.MessageType.reply)
+                self.assertEqual(message.reference.type, discord.MessageReferenceType.reply)
+                self.assertIsInstance(message.reference.resolved, discord.Message)
+                await self.client.on_message(message)
+                message.channel.send.assert_awaited_once()
+                message.channel.fetch_message.assert_not_awaited()
+                self.assertEqual(len(self.provider.calls), before + 1)
+                data = json.loads(self.provider.calls[-1]["messages"][0]["content"])
+                self.assertIn("our original orchids conversation", json.dumps(data["recent_conversation"]))
+                self.assertEqual(self.archived()[-1]["channel"], f"ask:{interaction.channel_id}:{USER_ID}")
+
+    async def test_real_reply_after_restart_uses_saved_slash_response_id_without_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "reply.sqlite3")
+            store = Store(path)
+            first_engine = ChatEngine(self.config, store, self.provider, clock=lambda: self.now)
+            first_client = DiscordChat(first_engine)
+            first_client._connection.user = SimpleNamespace(id=BOT_ID)
+            interaction = self.interaction()
+            try:
+                await first_client.tree.ask(interaction, "our original orchids conversation")
+            finally:
+                await first_client.close()
+                store.close()
+            self.now += 16
+            reopened = Store(path)
+            restarted_engine = ChatEngine(self.config, reopened, self.provider, clock=lambda: self.now)
+            restarted_client = DiscordChat(restarted_engine)
+            restarted_client._connection.user = SimpleNamespace(id=BOT_ID)
+            try:
+                self.assertEqual(len(restarted_client._own_message_ids), 0)
+                message = self.gateway_message(interaction, message_id=888888888888888799,
+                                               resolved=False, client=restarted_client)
+                self.assertIsNone(message.reference.resolved)
+                self.assertIsNone(message.reference.cached_message)
+                await restarted_client.on_message(message)
+                message.channel.fetch_message.assert_not_awaited()
+                message.channel.send.assert_awaited_once()
+                self.assertEqual(len(self.provider.calls), 2)
+                data = json.loads(self.provider.calls[-1]["messages"][0]["content"])
+                self.assertIn("our original orchids conversation", json.dumps(data["recent_conversation"]))
+            finally:
+                await restarted_client.close()
+                reopened.close()
+
+    async def test_unrelated_gateway_messages_and_replies_to_people_stay_ignored_outside_allowlist(self):
+        interaction = self.interaction()
+        await self.client.tree.ask(interaction, "initial addressed question")
+        self.now += 16
+        before_archive = list(self.archived())
+        for index, (has_reference, mentioned) in enumerate(((False, False), (False, True), (True, False))):
+            with self.subTest(has_reference=has_reference, mentioned=mentioned):
+                message = self.gateway_message(interaction, message_id=888888888888888800 + index,
+                                               has_reference=has_reference, mentioned=mentioned,
+                                               target_author=USER_ID)
+                await self.client.on_message(message)
+                message.channel.send.assert_not_awaited()
+                message.channel.fetch_message.assert_not_awaited()
+        self.assertEqual(self.archived(), before_archive)
+        self.assertEqual(len(self.provider.calls), 1)
 
     async def test_slash_and_normal_messages_share_user_cooldown(self):
         await self.engine.process(Incoming(str(USER_ID), str(ALLOWED_CHANNEL_ID), "ordinary chat", True))

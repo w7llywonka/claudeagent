@@ -46,8 +46,9 @@ class DiscordChat(discord.Client):
         config = self.engine.config
         log.info("Message archive: passive=%s retention_days=%d max_rows=%d max_text_mib=%d",
                  config.passive_learning, config.message_retention_days, config.message_max_rows, config.message_max_mb)
+        log.info("Chat memory recall enabled; verified replies enabled; cooldown_seconds=%d", config.cooldown_seconds)
 
-    async def _is_reply_to_bot(self, message):
+    async def _is_reply_to_bot(self, message, *, allow_fetch=True):
         reference = message.reference
         if reference is None or self.user is None or not reference.message_id:
             return False
@@ -73,6 +74,8 @@ class DiscordChat(discord.Client):
         if key in self._reference_results:
             self._reference_results.move_to_end(key)
             return self._reference_results[key]
+        if not allow_fetch:
+            return False  # An allowed direct mention already authorizes the request.
         now = time.monotonic()
         while self._reference_lookups and now - self._reference_lookups[0] >= 60:
             self._reference_lookups.popleft()
@@ -111,15 +114,20 @@ class DiscordChat(discord.Client):
             text = re.sub(rf"<@!?{bot_id}>", "", message.content).strip()
             candidate = Incoming(str(message.author.id), str(message.channel.id), text,
                                  mentioned, message.guild is None, message.author.bot)
-            if not self.engine.allowed(candidate):
+            # /ask can speak beyond the ambient allowlist. Verify a reply target
+            # before deciding whether this explicit conversation is allowed.
+            ordinarily_allowed = self.engine.allowed(candidate)
+            if not ordinarily_allowed and message.reference is None:
                 return
             with self.engine.pending_incoming(candidate.user) as pending:
-                replied = False if mentioned else await self._is_reply_to_bot(message)
+                replied = await self._is_reply_to_bot(message, allow_fetch=not (ordinarily_allowed and mentioned))
                 if not pending["valid"]:
                     return  # The sender erased their data during the Discord lookup.
+            if not ordinarily_allowed and not replied:
+                return
             event = Incoming(str(message.author.id), str(message.channel.id), text,
                              mentioned or replied, message.guild is None, message.author.bot,
-                             message_id=str(message.id))
+                             message_id=str(message.id), is_bot_reply=replied)
             answer = await self.engine.process(event)
             if answer:
                 # Plain content only. No embeds, files, tools, eval or command dispatch.

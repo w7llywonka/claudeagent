@@ -125,6 +125,21 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await self.engine.process(self.event()))
         self.assertEqual(len(self.provider.calls), 3)
 
+    async def test_verified_reply_cooldown_notice_is_limited_without_extra_model_calls(self):
+        self.configure(cooldown_seconds=60)
+        started = self.now
+        await self.engine.process(self.event("initial conversation"))
+        self.now = started + 1
+        self.assertIsInstance(await self.engine.process(self.event("quick reply", is_bot_reply=True)), str)
+        self.now = started + 2
+        self.assertIsNone(await self.engine.process(self.event("another reply", channel=OTHER_CHANNEL, is_bot_reply=True)))
+        self.now = started + 16
+        self.assertIsInstance(await self.engine.process(self.event("later reply", is_bot_reply=True)), str)
+        self.assertEqual(len(self.provider.calls), 1)
+        self.now = started + 60
+        self.assertIsInstance(await self.engine.process(self.event("ready now", is_bot_reply=True)), str)
+        self.assertEqual(len(self.provider.calls), 2)
+
     async def test_untriggered_message_learns_locally_without_api_or_admission(self):
         self.assertIsNone(await self.engine.process(self.event("just chatting", triggered=False)))
         self.assertEqual(self.provider.calls, [])
@@ -164,9 +179,39 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["text"] for row in data["recent_conversation"]], [
             f"past message marker {index}" for index in range(24, 30)
         ])
-        self.assertNotIn("past message marker 0", json.dumps(payload))
+        self.assertLessEqual(len(data.get("earlier_messages_from_current_speaker", [])), 3)
         self.assertEqual(data["current_message"], "unique current message marker")
         self.assertNotIn("unique current message marker", json.dumps(data["recent_conversation"]))
+
+    async def test_recall_retrieves_older_matching_archive_only_for_current_user_and_channel(self):
+        own_text = "I grow orchids on my balcony"
+        await self.engine.process(self.event(own_text, triggered=False, message_id="700000000000000001"))
+        await self.engine.process(self.event("I keep orchids in a private greenhouse", user="another-person", triggered=False))
+        await self.engine.process(self.event("orchids remind me of Paris", channel=OTHER_CHANNEL, triggered=False))
+        self.now += 1901
+        await self.engine.process(self.event("what did I say about orchids?", message_id="700000000000000002"))
+        payload = self.provider.calls[0]
+        data = json.loads(payload["messages"][0]["content"])
+        earlier = data["earlier_messages_from_current_speaker"]
+        self.assertEqual(data["recent_conversation"], [])
+        self.assertIn(own_text, earlier)
+        self.assertLessEqual(len(earlier), 3)
+        self.assertTrue(all(len(text) <= 240 for text in earlier))
+        self.assertNotIn("private greenhouse", json.dumps(payload))
+        self.assertNotIn("Paris", json.dumps(payload))
+        self.assertNotIn(own_text, json.dumps(payload["system"]))
+        self.assertEqual([message["role"] for message in payload["messages"]], ["user"])
+
+    async def test_recall_does_not_repeat_recent_or_current_messages(self):
+        recent = "orchids grow beside my window"
+        current = "can we talk about orchids?"
+        await self.engine.process(self.event(recent, triggered=False, message_id="700000000000000011"))
+        self.now += 1
+        await self.engine.process(self.event(current, message_id="700000000000000012"))
+        data = json.loads(self.provider.calls[0]["messages"][0]["content"])
+        self.assertIn(recent, json.dumps(data["recent_conversation"]))
+        self.assertEqual(data["current_message"], current)
+        self.assertEqual(data["earlier_messages_from_current_speaker"], [])
 
     async def test_passive_setting_disables_background_storage_but_keeps_addressed_messages(self):
         self.configure(passive_learning=False)
@@ -462,6 +507,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.store.set_opt_out(USER, True)
         with patch.object(self.store, "recent", side_effect=AssertionError("context was read")), \
                 patch.object(self.store, "memories", side_effect=AssertionError("memory was read")), \
+                patch.object(self.store, "recall", side_effect=AssertionError("archive recall was read")), \
                 patch.object(self.store, "style", side_effect=AssertionError("style was read")), \
                 patch.object(self.store, "channel_style", side_effect=AssertionError("channel style was read")), \
                 patch.object(self.store, "archive_message", side_effect=AssertionError("message was archived")), \
@@ -471,6 +517,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         user_data = json.loads(self.provider.calls[0]["messages"][0]["content"])
         self.assertEqual(user_data["recent_conversation"], [])
         self.assertEqual(user_data["remembered_facts_from_current_speaker"], [])
+        self.assertEqual(user_data["earlier_messages_from_current_speaker"], [])
         self.assertEqual(user_data["style_observations"], {})
 
 
