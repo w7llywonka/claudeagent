@@ -244,6 +244,44 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.recent(CHANNEL, now=self.now), [])
         self.assertEqual(self.archived(), [])
 
+    async def test_explicit_app_command_bypasses_ambient_allowlist_but_never_allows_bot_authors(self):
+        external = self.event(channel="999999999999999999", triggered=False)
+        self.assertIsNone(await self.engine.process(external))
+        self.assertEqual(self.archived(), [])
+        self.assertIsNone(await self.engine.process(replace(external, is_app_command=True, is_bot=True)))
+        self.assertEqual(self.provider.calls, [])
+        self.assertIsInstance(await self.engine.process(replace(external, is_app_command=True)), str)
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertEqual(self.archived()[0]["channel"], f"ask:{external.channel}:{USER}")
+
+    async def test_app_command_remember_and_forget_use_invoker_memory_scope(self):
+        self.configure(cooldown_seconds=0)
+        external = self.event(channel="999999999999999999", triggered=False, is_app_command=True)
+        scope = f"ask:{external.channel}:{USER}"
+        await self.engine.process(replace(external, text="!remember I like chess"))
+        self.assertEqual(self.store.memories(scope, USER, "chess"), ["I like chess"])
+        self.assertEqual(self.store.memories(external.channel, USER, "chess"), [])
+        await self.engine.process(replace(external, text="chess sounds good"))
+        data = json.loads(self.provider.calls[0]["messages"][0]["content"])
+        self.assertEqual(data["remembered_facts_from_current_speaker"], ["I like chess"])
+        await self.engine.process(replace(external, text="!forget"))
+        self.assertEqual(self.store.memories(scope, USER, "chess"), [])
+        self.assertEqual(self.archived(), [])
+
+    async def test_app_command_scopes_share_physical_channel_concurrency_limit(self):
+        external = self.event(channel="999999999999999999", is_app_command=True)
+        self.provider.gate = asyncio.Event()
+        first = asyncio.create_task(self.engine.process(external))
+        await asyncio.wait_for(self.provider.entered.wait(), 1)
+        try:
+            response = await asyncio.wait_for(self.engine.process(replace(external, user="other-person")), 0.5)
+            self.assertIsInstance(response, str)
+            self.assertEqual(len(self.provider.calls), 1)
+        finally:
+            self.provider.gate.set()
+            await asyncio.wait_for(first, 1)
+        self.assertEqual(self.engine._active_channels, set())
+
     async def test_enabled_dms_and_explicit_auto_reply_channels_trigger(self):
         self.configure(enable_dms=True, auto_reply_channels=frozenset({OTHER_CHANNEL}))
         self.assertIsNotNone(await self.engine.process(self.event(is_dm=True, triggered=False)))

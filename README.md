@@ -1,6 +1,6 @@
 # Discord Haiku chat bot
 
-A small, text-only Discord bot for Railway. It uses **Claude Haiku 5.5 at low effort with thinking disabled**, keeps replies short, and adapts its writing style using local statistics. By default, it saves new human text messages in allowed channels and learns their writing style locally, even when nobody mentions it. It only calls Claude when someone addresses it, unless you explicitly enable an automatic-reply channel.
+A small, text-only Discord bot for Railway. It uses **Claude Haiku 5.5 at low effort with thinking disabled**, keeps replies short, and adapts its writing style using local statistics. By default, it saves new human text messages in allowed channels and learns their writing style locally, even when nobody mentions it. It calls Claude for **`/ask question:your message`**, a mention, a reply to the bot, or a message in an explicitly enabled automatic-reply channel.
 
 Defaults: **one chat request per person every 15 seconds**, **120 output tokens**, **45 words**, **300 characters**, and shared allowances of **$0.50/day, $5/month, $5 total**. The API output limit has an absolute ceiling of **20,000 tokens**, even when changing configuration. Leave the default at 120 for ordinary conversation.
 
@@ -12,7 +12,7 @@ The bot cannot run commands, browse links, use tools, or change its settings thr
 
 1. Open the [Discord Developer Portal](https://discord.com/developers/applications), create an application, and open **Bot**.
 2. Create/reset the bot token and keep it for Railway's `DISCORD_TOKEN` variable. Enable **Message Content Intent** under Privileged Gateway Intents. The bot needs this to read allowed-channel conversation and commands. Larger verified bots may require approval. [Discord intent documentation](https://docs.discord.com/developers/events/gateway#message-content-intent)
-3. Install the application into your server with the **bot** scope. Grant **View Channel**, **Send Messages**, and **Read Message History** in the intended ordinary text channel. Read Message History lets the bot verify an older reply target if Discord omits it from the event. Administrator permissions are unnecessary. If using a thread, also grant **Send Messages in Threads** and allow that thread's own ID.
+3. Install the application into your server with the **bot** and **applications.commands** scopes. Grant **View Channel**, **Send Messages**, and **Read Message History** in the intended ordinary text channel. Read Message History lets the bot verify an older reply target if Discord omits it from the event. Administrator permissions are unnecessary. If using a thread, also grant **Send Messages in Threads** and allow that thread's own ID.
 4. In Discord, enable **User Settings → Advanced → Developer Mode**. Right-click the intended channel and choose **Copy Channel ID**. Copy your own user ID the same way if you want the owner-only `!budget` command.
 5. Obtain an API key with credits and access to Haiku 5.5 from the [Claude Console](https://platform.claude.com/).
 
@@ -37,19 +37,32 @@ The container briefly starts its entrypoint as root to prepare the exact databas
 
 Setup uses Railway's dashboard deliberately: its older `railway.json`/`railway.toml` Config as Code is deprecated, with legacy support documented through December 1, 2026. [Railway configuration documentation](https://docs.railway.com/config-as-code/reference)
 
+### Add `/ask` to your Discord account
+
+At startup, the bot tries to enable both **User Install** and **Guild Install**, adds missing command scopes while preserving the application's existing installation permissions, and registers `/ask` globally. Look for **`Registered global /ask`** in Railway's logs. Commands use the existing Discord Gateway connection; no public HTTP endpoint is needed. [Discord command contexts](https://docs.discord.com/developers/interactions/application-commands#contexts)
+
+Open the app's Discord profile or installation link and choose **Add to My Apps** to install it to your account. Then use **`/ask question:your message`** in a supported server, DM or group DM. An existing installation may need to be refreshed or added again before `/ask` appears in the command picker.
+
+If automatic setup fails, open the application's **Installation** page in the Discord Developer Portal. Under **Installation Contexts**, enable **User Install** and **Guild Install**, then save. Under **Default Install Settings**, give **User Install** the `applications.commands` scope and **Guild Install** both `applications.commands` and `bot`; keep the server permissions listed above. Choose **Discord Provided Link** under **Install Link** if the app does not already have a usable installation link. That link offers **Add to My Apps** or **Add to Server**. Redeploy to retry command registration. [Discord user-install setup](https://docs.discord.com/developers/tutorials/developing-a-user-installable-app)
+
+Public answers depend on Discord's channel permissions. **Use External Apps** controls public replies from a user-installed app that is not also installed to that server; **Send Messages** can also restrict public responses. [Discord permissions](https://docs.discord.com/developers/topics/permissions), [application response restrictions](https://docs.discord.com/developers/resources/application). When Discord permits only a private response, `/ask` returns a private explanation and does not call Claude or store the question. **`/ask question:!forget`** and **`/ask question:!optout`** still work in that situation and confirm privately.
+
 ### 3. Choose when it talks
 
+- **Slash command:** use **`/ask question:your message`** for a public reply. The app registers `/ask` globally at startup for server and user installations. A user-installed app can receive explicit asks in Discord locations where that installation is available, including outside this bot's ordinary channel allowlist. `/ask` uses the same model, cooldown, shared rate limit, concurrency limit and budget as ordinary bot conversations. It needs no additional environment variables.
 - **Default:** mention the bot **or use Discord's Reply action on one of its messages**. The reply's mention/ping toggle can be off. Reply detection checks the Discord event, local cache, and up to 4,096 persisted bot-message IDs, which survive restarts. If needed, it fetches only the exact message being replied to and checks its author; it never scans channel history. The fallback requires **Read Message History** and is limited to 20 lookups per minute, two concurrent lookups, and a five-second timeout. No Claude tokens are used for this check.
 - **Dedicated chat channel:** set `AUTO_REPLY_CHANNEL_IDS` to a subset of `ALLOWED_CHANNEL_IDS`. Every human message there is eligible for a reply, subject to the same limits.
-- **Direct messages:** set `ENABLE_DMS=true` to allow them. They are disabled by default.
+- **Ordinary direct messages:** set `ENABLE_DMS=true` to allow regular DM chat. It is disabled by default; explicit `/ask` works independently.
 
-An invalid `ALLOWED_CHANNEL_IDS` prevents startup. An empty list permits no server channels and prevents startup unless DMs are explicitly enabled. Channels outside the allowlist are ignored. Other bots and webhooks do not trigger conversations. A person's chat cooldown applies across channels and survives restarts; it is not a separate allowance in every channel.
+An invalid `ALLOWED_CHANNEL_IDS` prevents startup. An empty list permits no ordinary server-channel messages and prevents startup unless DMs are explicitly enabled. Ordinary messages outside the allowlist are ignored; explicit `/ask` commands are handled separately. Other bots and webhooks do not trigger conversations. A person's chat cooldown applies across channels and survives restarts; it is not a separate allowance in every channel.
+
+In an allowed server channel, `/ask` shares the channel's existing recent conversation and style. In a DM or outside an allowed server channel, its saved questions, replies, facts and style are isolated by **person and channel**. One person's external `/ask` history is never supplied as another person's context. Installing the app to a user account does not enable passive collection of ordinary messages outside the configured allowlist. `/ask` questions are public, so do not put private information in them.
 
 Change `COOLDOWN_SECONDS` in Railway variables and redeploy to adjust it whenever you want. The default is `15`; `0` means **no per-user cooldown**. Whole-number values from `0` to `86400` are accepted. Shared rate limits, spending limits and one in-flight reply per user/channel still apply, including at zero cooldown. These reply limits do not stop passive archiving or local style updates: eligible messages are still observed during a cooldown or when the API allowance is exhausted.
 
 ## Commands
 
-These are local commands and do not call Claude.
+`/ask question:your message` chats with Claude. The following text commands run locally and do not call Claude. They also work inside the question field, such as **`/ask question:!forget`** or **`/ask question:!optout`**, including from a user installation outside an allowed bot channel. These two privacy commands confirm privately and apply to all of that person's stored data across the bot.
 
 | Command | What it does |
 | --- | --- |
@@ -65,7 +78,7 @@ Forgetting local data does not delete messages already posted to Discord or requ
 
 ## Passive message archive and style learning
 
-With `PASSIVE_LEARNING=true`, the bot archives **every new eligible human text message it receives in allowed channels**, including unmentioned messages and messages sent during reply cooldowns, API outages or after the API budget runs out. Bots, webhooks, disallowed channels and opted-out users are excluded. `!forget` and `!optout` are never retained. Other commands and obvious instruction-override attempts are archived for eligible users but excluded from style learning and recent prompt context. Stored text is sanitized and capped at 4,000 characters per message; Discord message IDs prevent duplicate recording. Attachments are not downloaded, linked pages are not read, and old Discord history is not backfilled.
+With `PASSIVE_LEARNING=true`, the bot archives **every new eligible human text message it receives in allowed channels**, including unmentioned messages and messages sent during reply cooldowns, API outages or after the API budget runs out. Bots, webhooks, ordinary messages in disallowed channels and opted-out users are excluded. Explicit `/ask` questions are eligible even outside the allowlist, using the isolated memory described above. `!forget` and `!optout` are never retained. Other commands and obvious instruction-override attempts are archived for eligible users but excluded from style learning and recent prompt context. Stored text is sanitized and capped at 4,000 characters per message; Discord message or interaction IDs prevent duplicate recording. Attachments are not downloaded, linked pages are not read, and old Discord history is not backfilled.
 
 The archive stays local in SQLite on the Railway volume. Its default limits are **30 days, 50,000 messages, and 64 MiB of stored message text** across the bot. The oldest messages are removed when a row-count or text-size limit is reached; expired rows are cleaned on startup and roughly hourly. The text-size limit counts UTF-8 bytes, not the whole database file. Set `MESSAGE_RETENTION_DAYS` (1–365), `MESSAGE_MAX_ROWS` (100–1,000,000), and `MESSAGE_MAX_MB` (1–128) to change these limits. `!forget` and `!optout` still clear the user's archived content.
 
@@ -113,7 +126,7 @@ Use `.env.example` as a complete variable reference. Booleans use `true` or `fal
 | `MESSAGE_MAX_ROWS` | `50000` | Maximum archived messages across the bot, 100–1,000,000 |
 | `MESSAGE_MAX_MB` | `64` | Maximum archived text in MiB of UTF-8 bytes, 1–128; excludes SQLite overhead |
 | `CACHE_SYSTEM_PROMPT` | `false` | Optional static policy cache marker |
-| `ENABLE_DMS` | `false` | Allow direct messages |
+| `ENABLE_DMS` | `false` | Allow ordinary direct messages; explicit `/ask` works independently |
 | `AUTO_REPLY_CHANNEL_IDS` | empty | Allowed channels that respond without mentions |
 | `OWNER_IDS` | empty | Users allowed to inspect `!budget` |
 | `DB_PATH` | `data/chat.db` | Local path; use `/data/chat.db` in Docker/Railway |
@@ -158,6 +171,7 @@ The included GitHub Actions workflow builds the Railway Docker image, runs the o
 - Confirm the bot is online and `ALLOWED_CHANNEL_IDS` contains the current channel's exact ID.
 - Enable Message Content Intent in the Discord portal and redeploy.
 - Mention the bot or use Reply on one of its messages. For an older reply target outside its saved IDs/cache, enable **Read Message History** in that channel so it can verify the specific message. The reply mention/ping toggle can stay off.
+- For `/ask`, confirm the app is installed to your account or server and check the startup log for command registration. If it is absent from the picker, refresh or re-add the installation. A slash command gets a short local explanation when a shared limit or cooldown blocks it. A private permission notice means Discord did not permit a public answer; no Claude call was made.
 - Wait out `COOLDOWN_SECONDS` (15 seconds by default); shared rate/concurrency limits can also prevent a request.
 - Check Railway logs for authentication/model-access errors and inspect `!budget` as an owner. A depleted allowance deliberately stops paid replies.
 - If startup reports volume permissions, keep the default Docker entrypoint and `/data` mount. Do not override it with a direct Python start command.

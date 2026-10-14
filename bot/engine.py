@@ -22,6 +22,7 @@ class Incoming:
     is_dm: bool = False
     is_bot: bool = False
     message_id: str | None = None
+    is_app_command: bool = False
 
 
 class ChatEngine:
@@ -33,8 +34,15 @@ class ChatEngine:
         self._privacy_notices = {}  # Only a short-lived local notice rate gate.
 
     def allowed(self, event: Incoming) -> bool:
-        return not event.is_bot and ((event.is_dm and self.config.enable_dms) or
+        return not event.is_bot and (event.is_app_command or (event.is_dm and self.config.enable_dms) or
                                     (not event.is_dm and event.channel in self.config.allowed_channels))
+
+    def _memory_channel(self, event: Incoming) -> str:
+        # Explicit user-installed asks can run beyond the ambient-channel allowlist.
+        # Their memory belongs only to that person in that location.
+        if event.is_app_command and (event.is_dm or event.channel not in self.config.allowed_channels):
+            return f"ask:{event.channel}:{event.user}"
+        return event.channel
 
     def clean(self, text):
         return scrub(text, (self.config.discord_token, self.config.api_key))
@@ -78,6 +86,7 @@ class ChatEngine:
         if not self.allowed(event) or not event.text.strip():
             return None
         now = self.clock()
+        memory_channel = self._memory_channel(event)
         # Bound before cleaning to avoid expensive work on long inputs.
         raw = event.text[:4000].strip()
         command, _, argument = raw.partition(" ")
@@ -91,25 +100,29 @@ class ChatEngine:
         text = archived_text[:self.config.max_input_chars]
         opted_out = self.store.opted_out(event.user)
         override = is_override(archived_text)
-        triggered = event.triggered or event.is_dm or event.channel in self.config.auto_reply_channels
+        triggered = event.is_app_command or event.triggered or event.is_dm or event.channel in self.config.auto_reply_channels
         recent = []
         if not opted_out and (self.config.passive_learning or triggered):
             # Capture every eligible message before reply cooldowns, outages or budget limits.
             # This archive is never loaded into the model request.
-            if not self.store.archive_message(event.channel, event.user, archived_text,
+            if not self.store.archive_message(memory_channel, event.user, archived_text,
                                               message_id=event.message_id, now=now):
                 return None  # A repeated Discord delivery must not learn or reply twice.
             if not raw.startswith("!") and not override:
                 if triggered:
                     # Snapshot before observing so current_message isn't repeated in history.
-                    recent = self.store.recent(event.channel, self.config.context_messages, now=now)
-                self.store.observe(event.channel, event.user, archived_text, now=now)
+                    recent = self.store.recent(memory_channel, self.config.context_messages, now=now)
+                self.store.observe(memory_channel, event.user, archived_text, now=now)
         if raw.startswith("!") and not is_command:
             return None  # Don't spend money reacting to other bots' commands.
         if not triggered and not is_command:
             return None  # Most Discord messages cost zero API tokens.
-        if self.store.admit(event.user, now, cooldown=self.config.cooldown_seconds,
-                            per_minute=self.config.max_per_minute) != "ok":
+        admission = self.store.admit(event.user, now, cooldown=self.config.cooldown_seconds,
+                                     per_minute=self.config.max_per_minute)
+        if admission != "ok":
+            if event.is_app_command:
+                return self._reply("give me a moment before asking again" if admission == "cooldown"
+                                   else "chat's busy right now, try again in a minute")
             return None  # Silent cooldown: no bot spam and no model calls.
         if is_command:
             return self._command(event, command, argument)
@@ -136,10 +149,10 @@ class ChatEngine:
                 if not entry["is_bot"] and entry["user"] not in aliases:
                     aliases[entry["user"]] = f"person{len(aliases)}"
                 rendered.append({"speaker": "bot" if entry["is_bot"] else aliases[entry["user"]], "text": entry["text"]})
-            memories = [] if opted_out else self.store.memories(event.channel, event.user, text, limit=3)
+            memories = [] if opted_out else self.store.memories(memory_channel, event.user, text, limit=3)
             style = {} if opted_out else {
-                "speaker": self.store.style(event.channel, event.user, now=now),
-                "channel": self.store.channel_style(event.channel, now=now),
+                "speaker": self.store.style(memory_channel, event.user, now=now),
+                "channel": self.store.channel_style(memory_channel, now=now),
             }
             payload = build_request(self.config, current=text, recent=rendered, memories=memories, style=style)
             estimate = reserve_cost(payload)
@@ -165,7 +178,7 @@ class ChatEngine:
                 return None
             answer = self._reply(result.text)
             if not opted_out and not self.store.opted_out(event.user):
-                self.store.observe(event.channel, "bot", answer, is_bot=True, now=self.clock(),
+                self.store.observe(memory_channel, "bot", answer, is_bot=True, now=self.clock(),
                                    sources=ticket["users"])
             return answer
         finally:
@@ -178,7 +191,7 @@ class ChatEngine:
         if command == "!help":
             interval = (f"one chat every {self.config.cooldown_seconds} seconds" if self.config.cooldown_seconds
                         else "no per-user cooldown")
-            return ("mention me or reply to me to chat. commands are !remember a fact, !forget, !optout, "
+            return ("use /ask, mention me or reply to me to chat. commands are !remember a fact, !forget, !optout, "
                     "!optin, !privacy and !budget. " + interval)
         if command == "!privacy":
             return (f"i save chat locally for up to {self.config.message_retention_days} days, less if storage fills. "
@@ -195,7 +208,7 @@ class ChatEngine:
                 return "say !remember followed by a short fact you want me to keep"
             if is_override(fact):
                 return "i can remember little facts, but not instructions to change how i work"
-            self.store.remember(event.channel, event.user, fact, now=self.clock())
+            self.store.remember(self._memory_channel(event), event.user, fact, now=self.clock())
             return "got it, i'll keep that in mind here"
         if command == "!budget":
             if event.user not in self.config.owner_ids:

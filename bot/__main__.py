@@ -8,6 +8,7 @@ import time
 import discord
 
 from .config import Config
+from .commands import ChatCommands
 from .engine import ChatEngine, Incoming
 from .provider import ClaudeClient
 from .store import Store
@@ -30,6 +31,15 @@ class DiscordChat(discord.Client):
         self._reference_lookups = deque(maxlen=20)
         self._reference_inflight = 0
         self._handlers = set()
+        self.tree = ChatCommands(self)
+
+    async def setup_hook(self):
+        try:
+            await self.tree.register()
+        except discord.HTTPException as exc:
+            # Existing message chat can remain online if application setup needs attention.
+            log.error("Slash registration failed status=%s; enable User Install and Guild Install with "
+                      "applications.commands in Discord application Installation settings", exc.status)
 
     async def on_ready(self):
         log.info("Connected to Discord; model=claude-haiku-5-5 effort=low; allowed_channels=%d", len(self.engine.config.allowed_channels))
